@@ -1,0 +1,93 @@
+{
+  "recommendation": "MANUAL_REVIEW",
+  "explanation": "This application is borderline because monthly debt obligations are high relative to income and missed payments in the last year raise concerns.",
+  "interview_questions": [
+    {
+      "order": 1,
+      "question": "Your debt-to-income ratio is high. Are any debts close to being paid off?",
+      "feature": "debt_to_income_ratio",
+      "follow_up": "Can you provide payoff letters or consolidation plan?",
+      "contribution": -0.06580811218987606
+    },
+    {
+      "order": 2,
+      "question": "You missed some payments recently. Were these due to temporary circumstances?",
+      "feature": "missed_payments_12m",
+      "follow_up": "Can you demonstrate improved payment behavior?",
+      "contribution": -0.05467065325502878
+    },
+    {
+      "order": 3,
+      "question": "We noticed some inconsistencies in your submitted documents. Can you clarify these?",
+      "feature": "document_mismatch_flag",
+      "follow_up": "Can you provide original or certified copies?",
+      "contribution": -0.030068283274365684
+    },
+    {
+      "order": 4,
+      "question": "Can you provide more details about how you'll use this loan?",
+      "feature": "loan_purpose",
+      "follow_up": "Do you have documentation supporting this purpose?",
+      "contribution": -0.0277545116245678
+    },
+    {
+      "order": 5,
+      "question": "You have some late payments in the last 12 months. What caused these delays?",
+      "feature": "late_payments_12m",
+      "follow_up": "Have your circumstances improved since then?",
+      "contribution": -0.017643202473222427
+    }
+  ],
+  "documents_needed": [
+    "Current debt statements",
+    "Payoff letters",
+    "Debt consolidation plan",
+    "Explanation letter",
+    "Proof of resolved situation",
+    "Recent payment history"
+  ],
+  "improvement_actions": [
+    {
+      "action": "Pay down credit card debt",
+      "feasibility": "short-term",
+      "feature": "debt_to_income_ratio",
+      "impact": -0.06580811218987606
+    },
+    {
+      "action": "Consolidate high-interest debt",
+      "feasibility": "short-term",
+      "feature": "debt_to_income_ratio",
+      "impact": -0.06580811218987606
+    },
+    {
+      "action": "Reduce loan amount by 20%",
+      "feasibility": "immediate",
+      "feature": "debt_to_income_ratio",
+      "impact": -0.06580811218987606
+    },
+    {
+      "action": "Show improved payment pattern",
+      "feasibility": "short-term",
+      "feature": "missed_payments_12m",
+      "impact": -0.05467065325502878
+    },
+    {
+      "action": "Explain one-time circumstances",
+      "feasibility": "short-term",
+      "feature": "missed_payments_12m",
+      "impact": -0.05467065325502878
+    },
+    {
+      "action": "Provide guarantor",
+      "feasibility": "short-term",
+      "feature": "missed_payments_12m",
+      "impact": -0.05467065325502878
+    }
+  ],
+  "pd_improvement_estimate": {
+    "current_pd": "68.5%",
+    "potential_pd": "60.0%",
+    "improvement": "8.5%",
+    "note": "Estimate assumes all recommended actions are completed. Actual improvement may vary."
+  }
+}
