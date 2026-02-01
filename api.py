@@ -10,6 +10,8 @@ import pandas as pd
 import os
 import uuid
 from datetime import datetime
+import pytesseract 
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 import sys
 
 # Add root directory to path to ensure imports work
@@ -18,6 +20,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Import core modules
 from core.lime_explainer import LoanLimeExplainer
 from core.borderline_advisor import analyze_borderline_application
+from core.decision_engine import analyze_application_complete
+from core.document_extractor import process_uploaded_document, validate_extracted_data
+from core.improvement_suggester import generate_ai_suggestions
+from core.interview_questioner import generate_interview_questions
 
 app = FastAPI(
     title="Credify API",
@@ -82,14 +88,7 @@ class AnalysisResponse(BaseModel):
     model_version: str
 
 
-def get_risk_band(pd_score: float) -> str:
-    """Determine risk band based on PD score"""
-    if pd_score < 0.05:
-        return "Low"
-    elif pd_score < 0.15:
-        return "Middle"
-    else:
-        return "High"
+
 
 
 def load_model():
@@ -134,7 +133,7 @@ async def health_check():
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def analyze_application(application: CustomerApplication):
     """
-    Analyze a loan application and return comprehensive decision intelligence
+    Analyze a loan application using the complete decision engine from hackathon_final.ipynb
     """
     try:
         # Generate application ID
@@ -142,65 +141,133 @@ async def analyze_application(application: CustomerApplication):
 
         # Convert to dict for processing
         customer_data = application.dict()
+        
+        # DEBUG: Log the received data
+        print("\n" + "="*50)
+        print("ANALYZE ENDPOINT RECEIVED:")
+        print(f"  monthly_income: {customer_data.get('monthly_income')}")
+        print(f"  savings_balance: {customer_data.get('savings_balance')}")
+        print(f"  fixed_monthly_expenses: {customer_data.get('fixed_monthly_expenses')}")
+        print(f"  employment_years: {customer_data.get('employment_years')}")
+        print(f"  credit_score: {customer_data.get('credit_score')}")
+        print("="*50 + "\n")
 
-        # Load model and get prediction
+        # Load model and explainer
         model = load_model()
-        feature_names = model.feature_names
-
-        # Create DataFrame with correct feature order
-        row_data = {f: customer_data.get(f, 0) for f in feature_names}
-        feature_df = pd.DataFrame([row_data])
-
-        # Get prediction probabilities
-        prob = model.predict_proba(feature_df)
-        pd_score = 1 - prob[0][1]  # PD = 1 - P(approve)
-
-        # Get LIME explanations
         exp = get_explainer()
-        lime_features = exp.explain(customer_data, num_features=15)
 
-        # Determine fraud flags
-        fraud_severity = "none"
-        if customer_data.get('document_mismatch_flag', 0) == 1:
-            fraud_severity = "soft"
-        if customer_data.get('geo_location_mismatch', 0) == 1 and customer_data.get('income_inflation_ratio', 1.0) > 1.3:
-            fraud_severity = "hard"
-
-        fraud_flags = {
-            "severity": fraud_severity,
-            "details": "Document or location inconsistencies detected" if fraud_severity != "none" else ""
-        }
-
-        # Run borderline advisor
-        result = analyze_borderline_application(
-            pd_score=pd_score,
-            lime_features=lime_features,
-            fraud_flags=fraud_flags
+        # Use complete decision engine from hackathon_final.ipynb
+        analysis = analyze_application_complete(
+            raw=customer_data,
+            model=model,
+            explainer=exp,
+            pipeline=None
         )
+
+        # Run borderline advisor for additional details (interview questions, documents, etc.)
+        borderline_result = analyze_borderline_application(
+            pd_score=analysis["pd_score"],
+            lime_features=analysis["lime_features"],
+            fraud_flags={
+                "severity": "hard" if analysis["fraud_decision"] == "BLOCK" else ("soft" if analysis["fraud_score"] >= 0.25 else "none"),
+                "details": analysis["fraud"]
+            }
+        )
+
+        # Generate AI personalized interview questions based on model insights
+        interview_questions = generate_interview_questions(
+            raw_data=customer_data,
+            lime_features=analysis["lime_features"],
+            pd_score=analysis["pd_score"]
+        )
+        
+        print(f"\n📋 Generated {len(interview_questions)} personalized interview questions")
+
+        # Generate AI suggestions based on actual feature impact
+        ai_suggestions = generate_ai_suggestions(
+            raw_data=customer_data,
+            model=model,
+            current_pd=analysis["pd_score"],
+            lime_features=analysis["lime_features"]
+        )
+        
+        print(f"\n✨ Generated {len(ai_suggestions)} AI improvement suggestions")
+        for sugg in ai_suggestions:
+            print(f"  - {sugg['user_friendly']}: {sugg['pd_reduction']} reduction")
+
+        # Calculate combined PD improvement from suggestions
+        # Extract the best PD we can achieve if all suggestions are implemented
+        if ai_suggestions:
+            # Get the lowest PD from the best suggestion
+            best_new_pd = float(ai_suggestions[0]["new_estimated_pd"].rstrip('%')) / 100
+            current_pd_decimal = analysis["pd_percent"] / 100
+            total_improvement = current_pd_decimal - best_new_pd
+            improvement_percent = (total_improvement / current_pd_decimal * 100) if current_pd_decimal > 0 else 0
+            
+            pd_improvement_estimate = {
+                "current_pd": f"{analysis['pd_percent']:.1f}%",
+                "potential_pd": f"{best_new_pd * 100:.1f}%",
+                "improvement": f"{improvement_percent:.1f}%",
+                "note": "Estimate assumes the top-ranked improvement action is completed. Actual improvement may vary."
+            }
+        else:
+            pd_improvement_estimate = {
+                "current_pd": f"{analysis['pd_percent']:.1f}%",
+                "potential_pd": f"{analysis['pd_percent']:.1f}%",
+                "improvement": "0.0%",
+                "note": "No significant improvement opportunities identified at this time."
+            }
+
+        # Map decision to recommendation
+        decision_map = {
+            "APPROVED": "APPROVE",
+            "REJECTED": "REJECT",
+            "MIDDLE": "MANUAL_REVIEW",
+            "BLOCKED_FRAUD": "REJECT"
+        }
+        
+        recommendation = decision_map.get(analysis["decision"], "MANUAL_REVIEW")
 
         # Store application
         applications_store[app_id] = {
             "application": customer_data,
-            "result": result,
-            "pd_score": pd_score,
+            "analysis": analysis,
             "timestamp": datetime.now().isoformat()
         }
 
-        # Build response
+        # Build response with AI suggestions
         response = AnalysisResponse(
             application_id=app_id,
-            pd_score=round(pd_score * 100, 2),
-            risk_band=get_risk_band(pd_score),
-            fraud_flag=fraud_severity != "none",
-            fraud_severity=fraud_severity,
-            recommendation=result["recommendation"],
-            explanation=result["explanation"],
-            interview_questions=result["interview_questions"],
-            documents_needed=result["documents_needed"],
-            improvement_actions=result["improvement_actions"],
-            pd_improvement_estimate=result["pd_improvement_estimate"],
+            pd_score=analysis["pd_percent"],
+            risk_band=analysis["risk_band"],
+            fraud_flag=analysis["fraud_decision"] == "BLOCK",
+            fraud_severity="hard" if analysis["fraud_decision"] == "BLOCK" else ("soft" if analysis["fraud_score"] >= 0.25 else "none"),
+            recommendation=recommendation,
+            explanation=analysis["summary"],
+            interview_questions=[
+                {
+                    "order": q["order"],
+                    "question": q["question"],
+                    "feature": q["feature"],
+                    "purpose": q["purpose"],
+                    "follow_up": q["follow_up"],
+                    "category": q.get("category", "General")
+                }
+                for q in interview_questions
+            ],
+            documents_needed=borderline_result.get("documents_needed", []),
+            improvement_actions=[
+                {
+                    "action": sugg["suggestion"],
+                    "feasibility": sugg["feasibility"],
+                    "feature": sugg["feature"],
+                    "impact": sugg["pd_reduction"]
+                }
+                for sugg in ai_suggestions
+            ],
+            pd_improvement_estimate=pd_improvement_estimate,
             timestamp=datetime.now().isoformat(),
-            model_version="v1.2.3"
+            model_version="v1.4.0-hackathon"
         )
 
         return response
@@ -212,12 +279,14 @@ async def analyze_application(application: CustomerApplication):
 @app.post("/api/documents/upload/{application_id}")
 async def upload_document(application_id: str, file: UploadFile = File(...)):
     """
-    Upload a document for an application
+    Upload a document for an application and extract data automatically
     """
     try:
-        # Validate file type
-        if not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        # Validate file type - support PDF and images
+        filename_lower = file.filename.lower()
+        supported_types = ('.pdf', '.png', '.jpg', '.jpeg', '.tiff')
+        if not any(filename_lower.endswith(ext) for ext in supported_types):
+            raise HTTPException(status_code=400, detail="Only PDF and image files are allowed (.pdf, .png, .jpg, .jpeg, .tiff)")
 
         # Create uploads directory if it doesn't exist
         uploads_dir = os.path.join(os.path.dirname(__file__), 'uploads', application_id)
@@ -233,6 +302,32 @@ async def upload_document(application_id: str, file: UploadFile = File(...)):
         with open(file_path, 'wb') as f:
             f.write(content)
 
+        # Determine document type from filename
+        if 'steg' in filename_lower or 'electricity' in filename_lower:
+            doc_type = 'bill'
+        elif 'bank' in filename_lower or 'statement' in filename_lower:
+            doc_type = 'bank_statement'
+        elif 'payslip' in filename_lower or 'salary' in filename_lower:
+            doc_type = 'payslip'
+        elif 'id' in filename_lower or 'cin' in filename_lower:
+            doc_type = 'id'
+        else:
+            doc_type = 'auto'
+
+        # Extract data from document
+        try:
+            extracted_data = process_uploaded_document(file_path, doc_type)
+            is_valid, validation_issues = validate_extracted_data(extracted_data)
+            extraction_status = "extracted" if is_valid else "extracted_with_issues"
+            extracted_fields = extracted_data.get('_extracted_fields', [])
+        except Exception as extract_err:
+            print(f"Error extracting data from {file.filename}: {str(extract_err)}")
+            extracted_data = {}
+            is_valid = False
+            extraction_status = "failed"
+            extracted_fields = []
+            validation_issues = [str(extract_err)]
+
         # Store document metadata
         if application_id not in documents_store:
             documents_store[application_id] = []
@@ -243,13 +338,19 @@ async def upload_document(application_id: str, file: UploadFile = File(...)):
             "stored_filename": safe_filename,
             "size": len(content),
             "uploaded_at": datetime.now().isoformat(),
-            "status": "uploaded",
-            "verified": False
+            "status": extraction_status,
+            "verified": False,
+            "extracted_data": extracted_data,
+            "extracted_fields": extracted_fields,
+            "validation": {
+                "is_valid": is_valid,
+                "issues": validation_issues
+            }
         }
         documents_store[application_id].append(doc_info)
 
         return {
-            "message": "Document uploaded successfully",
+            "message": "Document uploaded and extracted successfully" if is_valid else "Document uploaded with extraction issues",
             "document": doc_info
         }
 
@@ -283,6 +384,101 @@ async def verify_document(application_id: str, document_id: str):
             return {"message": "Document verified", "document": doc}
 
     raise HTTPException(status_code=404, detail="Document not found")
+
+
+@app.post("/api/documents/{application_id}/extract")
+async def extract_document_data(application_id: str, file: UploadFile = File(...)):
+    """
+    Extract data from uploaded document (bill, bank statement, payslip, etc.)
+    Returns extracted data in model-ready format
+    """
+    try:
+        if application_id not in applications_store:
+            raise HTTPException(status_code=404, detail="Application not found")
+        
+        # Save uploaded file temporarily
+        temp_dir = "temp_uploads"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        file_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
+        with open(file_path, 'wb') as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Determine document type from filename
+        filename_lower = file.filename.lower()
+        if 'steg' in filename_lower or 'electricity' in filename_lower:
+            doc_type = 'bill'
+        elif 'bank' in filename_lower or 'statement' in filename_lower:
+            doc_type = 'bank_statement'
+        elif 'payslip' in filename_lower or 'salary' in filename_lower:
+            doc_type = 'payslip'
+        elif 'id' in filename_lower or 'cin' in filename_lower:
+            doc_type = 'id'
+        else:
+            doc_type = 'auto'
+        
+        # Extract data from document
+        extracted_data = process_uploaded_document(file_path, doc_type)
+        
+        # Validate extracted data
+        is_valid, validation_issues = validate_extracted_data(extracted_data)
+        
+        # Clean up temp file
+        os.remove(file_path)
+        
+        return {
+            "application_id": application_id,
+            "document_type": doc_type,
+            "extracted_data": extracted_data,
+            "validation": {
+                "is_valid": is_valid,
+                "issues": validation_issues
+            },
+            "extracted_fields": extracted_data.get('_extracted_fields', []),
+            "message": "Data extracted successfully" if is_valid else "Data extracted with warnings"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Document extraction failed: {str(e)}")
+
+
+@app.post("/api/applications/auto-fill")
+async def auto_fill_application(application_id: str, extracted_data: Dict[str, Any]):
+    """
+    Auto-fill application form with extracted document data
+    Merges extracted data with any existing form data
+    """
+    try:
+        if application_id not in applications_store:
+            raise HTTPException(status_code=404, detail="Application not found")
+        
+        app_data = applications_store[application_id]["application"]
+        
+        # Merge extracted data with form data (extracted takes precedence)
+        merged = {**app_data}
+        
+        # Only update fields that were successfully extracted
+        for key, value in extracted_data.items():
+            if not key.startswith('_') and value is not None:  # Skip metadata
+                if key in merged:
+                    merged[key] = value
+        
+        # Store merged data
+        applications_store[application_id]["application"] = merged
+        applications_store[application_id]["auto_filled_from"] = extracted_data.get('_document_source')
+        applications_store[application_id]["auto_fill_date"] = datetime.now().isoformat()
+        
+        return {
+            "application_id": application_id,
+            "merged_data": merged,
+            "message": "Application auto-filled successfully"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/applications/{application_id}")
