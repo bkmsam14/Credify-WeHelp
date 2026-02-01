@@ -1,7 +1,7 @@
 """
 Credify API - FastAPI Backend for Loan Decision Intelligence System
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
@@ -10,6 +10,7 @@ import pandas as pd
 import os
 import uuid
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 import pytesseract 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 import sys
@@ -25,6 +26,17 @@ from core.document_extractor import process_uploaded_document, validate_extracte
 from core.improvement_suggester import generate_ai_suggestions
 from core.interview_questioner import generate_interview_questions
 
+# Import DocTR integration (with fallback support)
+try:
+    from core.doctr_integration import extract_document_with_doctr, validate_extracted_data_advanced, format_extraction_for_display
+    from core.doctr_extractor import initialize_ocr
+    DOCTR_AVAILABLE = True
+    print("✅ DocTR integration loaded")
+except ImportError as e:
+    DOCTR_AVAILABLE = False
+    print(f"⚠️  DocTR not available: {e}")
+    print("   Falling back to pdfplumber extraction")
+
 app = FastAPI(
     title="Credify API",
     description="Loan Decision Intelligence System API",
@@ -39,6 +51,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Load DocTR model on startup (before any requests)
+if DOCTR_AVAILABLE:
+    print("\n🚀 Initializing DocTR OCR model at startup...")
+    initialize_ocr()
+    print("✅ DocTR ready for document processing\n")
 
 # Global instances
 explainer = None
@@ -142,15 +160,113 @@ async def analyze_application(application: CustomerApplication):
         # Convert to dict for processing
         customer_data = application.dict()
         
-        # DEBUG: Log the received data
-        print("\n" + "="*50)
-        print("ANALYZE ENDPOINT RECEIVED:")
+        print("\n" + "="*60)
+        print("ANALYZING APPLICATION")
+        print("="*60)
+        print(f"\n🆔 Application ID: {app_id}")
+        print("\n📋 RECEIVED DATA:")
         print(f"  monthly_income: {customer_data.get('monthly_income')}")
         print(f"  savings_balance: {customer_data.get('savings_balance')}")
         print(f"  fixed_monthly_expenses: {customer_data.get('fixed_monthly_expenses')}")
         print(f"  employment_years: {customer_data.get('employment_years')}")
         print(f"  credit_score: {customer_data.get('credit_score')}")
-        print("="*50 + "\n")
+        
+        # Try to find and use extracted document data if available
+        print("\n📄 CHECKING FOR EXTRACTED DOCUMENT DATA...")
+        extracted_data_used = False
+        
+        # Copy documents from temporary IDs to the new application ID
+        if app_id not in documents_store:
+            documents_store[app_id] = []
+        
+        # Look for documents in any temp or other app IDs (any non-CR app IDs)
+        temp_app_ids = [key for key in documents_store.keys() if not key.startswith('CR-')]
+        print(f"\n  Found {len(temp_app_ids)} temporary applications")
+        
+        if temp_app_ids:
+            for temp_app_id in temp_app_ids:
+                if documents_store[temp_app_id]:
+                    doc_count = len(documents_store[temp_app_id])
+                    print(f"  ✓ Moving {doc_count} documents from {temp_app_id}")
+                    # Copy all documents to the new app ID
+                    documents_store[app_id].extend(documents_store[temp_app_id])
+                    # Clear the temp ID
+                    documents_store[temp_app_id] = []
+        else:
+            print(f"  ℹ️  No temporary documents found")
+        
+        # Look for documents in the NEW application ID first (where we just moved them)
+        docs_to_check = documents_store.get(app_id, [])
+        
+        # Find documents with extracted data
+        for doc in docs_to_check:
+            if doc.get("status") in ["extracted", "extracted_with_issues"] and doc.get("extracted_data"):
+                extracted_fields = doc.get("extracted_data", {})
+                doc_type = doc.get("extraction_info", {}).get("document_type", "UNKNOWN")
+                
+                if not extracted_fields:
+                    continue
+                
+                print(f"\n  Found extracted {doc_type} with fields: {list(extracted_fields.keys())}")
+                
+                # Try to map extracted fields to application fields
+                field_mapping = {
+                    # Generic mappings (work with GENERIC documents too)
+                    "name": None,  # Don't map name to any model field
+                    "credit_score": "credit_score",
+                    "monthly_income": "monthly_income",
+                    "income": "monthly_income",
+                    "salary": "monthly_income",
+                    "salaire": "monthly_income",
+                    "total_income": "monthly_income",
+                    "savings": "savings_balance",
+                    "savings_balance": "savings_balance",
+                    "balance": "savings_balance",
+                    "account_balance": "savings_balance",
+                    "closing_balance": "savings_balance",
+                    "amount_due": "loan_amount",
+                    "consumption": "fixed_monthly_expenses",  # utility consumption
+                    "expenses": "fixed_monthly_expenses",
+                }
+                
+                # Try to use extracted data to update fields
+                for extracted_field, extracted_value in extracted_fields.items():
+                    mapped_field = field_mapping.get(extracted_field.lower())
+                    
+                    # Skip fields that explicitly map to None
+                    if mapped_field is None:
+                        print(f"    ℹ️  Extracted {extracted_field}: {extracted_value} (not used for modeling)")
+                        continue
+                    
+                    if mapped_field:
+                        # Only override if field was using default value
+                        current_value = customer_data.get(mapped_field)
+                        
+                        # Check if it's a default value (try to use extracted if available)
+                        if current_value is not None:
+                            try:
+                                # Convert extracted value to number if needed
+                                if isinstance(extracted_value, str):
+                                    extracted_num = float(extracted_value.replace(',', '.'))
+                                else:
+                                    extracted_num = float(extracted_value)
+                                
+                                # Use extracted value
+                                customer_data[mapped_field] = extracted_num
+                                print(f"    ✓ Using extracted {extracted_field}: {extracted_num} → {mapped_field}")
+                                extracted_data_used = True
+                            except (ValueError, TypeError):
+                                print(f"    ✗ Could not parse extracted {extracted_field}: {extracted_value}")
+        
+        if not extracted_data_used:
+            print("    ⚠️  No relevant extracted data found. Using provided values.")
+        
+        print("\n📊 FINAL DATA FOR ANALYSIS:")
+        print(f"  monthly_income: {customer_data.get('monthly_income')}")
+        print(f"  savings_balance: {customer_data.get('savings_balance')}")
+        print(f"  fixed_monthly_expenses: {customer_data.get('fixed_monthly_expenses')}")
+        print(f"  loan_amount: {customer_data.get('loan_amount')}")
+        print("="*60 + "\n")
 
         # Load model and explainer
         model = load_model()
@@ -276,10 +392,119 @@ async def analyze_application(application: CustomerApplication):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/documents/upload/{application_id}")
-async def upload_document(application_id: str, file: UploadFile = File(...)):
+def _extract_document_background(file_path: str, application_id: str, file_id: str, filename: str):
     """
-    Upload a document for an application and extract data automatically
+    Background task to extract document data without blocking the HTTP response
+    """
+    try:
+        print(f"📋 Background extraction started for {filename}")
+        
+        # Extract data from document using DocTR (with fallback)
+        if DOCTR_AVAILABLE:
+            print(f"   Using DocTR extraction for {file_id}...")
+            from core.doctr_extractor import process_document
+            extraction_result = process_document(file_path)
+            
+            # Validate extraction
+            validation_result = validate_extracted_data_advanced(extraction_result)
+            
+            # Format for display
+            display_info = format_extraction_for_display(extraction_result)
+            
+            extracted_data = extraction_result.get("extracted_fields", {})
+            extracted_fields = list(extracted_data.keys())
+            is_valid = validation_result.get("is_valid", False)
+            extraction_status = "extracted" if is_valid else "extracted_with_issues"
+            validation_issues = validation_result.get("issues", [])
+            warnings = validation_result.get("warnings", [])
+            
+            extraction_info = {
+                "method": extraction_result.get("extraction_method", "doctr"),
+                "document_type": extraction_result.get("document_type", "UNKNOWN"),
+                "confidence_score": extraction_result.get("confidence_score", 0),
+                "ocr_confidence": extraction_result.get("ocr_confidence", 0),
+                "type_confidence": extraction_result.get("type_confidence", 0),
+                "field_count": extraction_result.get("field_count", 0),
+                "display_info": display_info
+            }
+        else:
+            print(f"   Using pdfplumber fallback for {file_id}...")
+            extracted_data = process_uploaded_document(file_path, 'auto')
+            is_valid, validation_issues = validate_extracted_data(extracted_data)
+            extracted_fields = extracted_data.get('_extracted_fields', [])
+            extraction_status = "extracted" if is_valid else "extracted_with_issues"
+            warnings = []
+            extraction_info = {
+                "method": "pdfplumber_fallback",
+                "document_type": "AUTO",
+                "confidence_score": 0.5,
+                "display_info": None
+            }
+            
+    except Exception as extract_err:
+        print(f"   ❌ Error extracting data: {str(extract_err)}")
+        import traceback
+        traceback.print_exc()
+        
+        extracted_data = {}
+        is_valid = False
+        extraction_status = "failed"
+        extracted_fields = []
+        validation_issues = [str(extract_err)]
+        warnings = []
+        extraction_info = {
+            "method": "error",
+            "document_type": "ERROR",
+            "confidence_score": 0.0,
+            "error": str(extract_err)
+        }
+
+    # Update document in store with extraction results
+    if application_id in documents_store:
+        for doc in documents_store[application_id]:
+            if doc["id"] == file_id:
+                doc["status"] = extraction_status
+                doc["extracted_data"] = extracted_data
+                doc["extracted_fields"] = extracted_fields
+                doc["validation"] = {
+                    "is_valid": is_valid,
+                    "issues": validation_issues,
+                    "warnings": warnings
+                }
+                doc["extraction_info"] = extraction_info
+                
+                print(f"   ✅ Extraction complete for {file_id}")
+                print(f"      Document type: {extraction_info.get('document_type')}")
+                print(f"      Status: {extraction_status}")
+                print(f"      Fields extracted: {len(extracted_fields)}")
+                print(f"      Document stored in app: {application_id}")
+                break
+    else:
+        print(f"   ⚠️  WARNING: App {application_id} not in documents_store!")
+        print(f"      Available apps: {list(documents_store.keys())}")
+        print(f"      Creating app entry and storing document...")
+        # Ensure app exists
+        if application_id not in documents_store:
+            documents_store[application_id] = []
+        documents_store[application_id].append({
+            "id": file_id,
+            "status": extraction_status,
+            "extracted_data": extracted_data,
+            "extracted_fields": extracted_fields,
+            "validation": {
+                "is_valid": is_valid,
+                "issues": validation_issues,
+                "warnings": warnings
+            },
+            "extraction_info": extraction_info
+        })
+
+
+@app.post("/api/documents/upload/{application_id}")
+async def upload_document(application_id: str, file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
+    """
+    Upload a document for an application and start background extraction
+    Returns immediately while extraction happens in background
     """
     try:
         # Validate file type - support PDF and images
@@ -302,33 +527,12 @@ async def upload_document(application_id: str, file: UploadFile = File(...)):
         with open(file_path, 'wb') as f:
             f.write(content)
 
-        # Determine document type from filename
-        if 'steg' in filename_lower or 'electricity' in filename_lower:
-            doc_type = 'bill'
-        elif 'bank' in filename_lower or 'statement' in filename_lower:
-            doc_type = 'bank_statement'
-        elif 'payslip' in filename_lower or 'salary' in filename_lower:
-            doc_type = 'payslip'
-        elif 'id' in filename_lower or 'cin' in filename_lower:
-            doc_type = 'id'
-        else:
-            doc_type = 'auto'
+        print(f"\n📄 Document uploaded: {file.filename}")
+        print(f"   File ID: {file_id}")
+        print(f"   Size: {len(content)} bytes")
+        print(f"   Status: Queued for extraction")
 
-        # Extract data from document
-        try:
-            extracted_data = process_uploaded_document(file_path, doc_type)
-            is_valid, validation_issues = validate_extracted_data(extracted_data)
-            extraction_status = "extracted" if is_valid else "extracted_with_issues"
-            extracted_fields = extracted_data.get('_extracted_fields', [])
-        except Exception as extract_err:
-            print(f"Error extracting data from {file.filename}: {str(extract_err)}")
-            extracted_data = {}
-            is_valid = False
-            extraction_status = "failed"
-            extracted_fields = []
-            validation_issues = [str(extract_err)]
-
-        # Store document metadata
+        # Store document with "pending" status
         if application_id not in documents_store:
             documents_store[application_id] = []
 
@@ -338,26 +542,57 @@ async def upload_document(application_id: str, file: UploadFile = File(...)):
             "stored_filename": safe_filename,
             "size": len(content),
             "uploaded_at": datetime.now().isoformat(),
-            "status": extraction_status,
+            "status": "pending",
             "verified": False,
-            "extracted_data": extracted_data,
-            "extracted_fields": extracted_fields,
+            "extracted_data": {},
+            "extracted_fields": [],
             "validation": {
-                "is_valid": is_valid,
-                "issues": validation_issues
+                "is_valid": False,
+                "issues": [],
+                "warnings": []
+            },
+            "extraction_info": {
+                "method": "pending",
+                "document_type": "UNKNOWN",
+                "confidence_score": 0.0
             }
         }
         documents_store[application_id].append(doc_info)
 
+        # Start background extraction task (non-blocking)
+        background_tasks.add_task(_extract_document_background, file_path, application_id, file_id, file.filename)
+
         return {
-            "message": "Document uploaded and extracted successfully" if is_valid else "Document uploaded with extraction issues",
+            "message": "Document uploaded successfully. Extraction in progress...",
             "document": doc_info
         }
 
     except HTTPException:
         raise
     except Exception as e:
+        print(f"   ❌ Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/debug/documents")
+async def debug_get_all_documents():
+    """
+    DEBUG ENDPOINT: Show all documents in store
+    """
+    result = {}
+    for app_id, docs in documents_store.items():
+        result[app_id] = [
+            {
+                "id": doc["id"],
+                "filename": doc["filename"],
+                "status": doc["status"],
+                "extracted_fields": len(doc.get("extracted_fields", []))
+            }
+            for doc in docs
+        ]
+    return {"total_apps": len(documents_store), "documents": result}
 
 
 @app.get("/api/documents/{application_id}")
@@ -367,6 +602,41 @@ async def get_documents(application_id: str):
     """
     docs = documents_store.get(application_id, [])
     return {"application_id": application_id, "documents": docs}
+
+
+@app.get("/api/documents/{application_id}/{document_id}/status")
+async def get_document_status(application_id: str, document_id: str):
+    """
+    Get extraction status of a specific document
+    Search across all applications if not found in the specified one
+    """
+    # First try the specified application
+    if application_id in documents_store:
+        for doc in documents_store[application_id]:
+            if doc["id"] == document_id:
+                return {
+                    "id": document_id,
+                    "status": doc["status"],
+                    "extracted_fields": doc.get("extracted_fields", []),
+                    "extracted_data": doc.get("extracted_data", {}),
+                    "extraction_info": doc.get("extraction_info", {}),
+                    "validation": doc.get("validation", {})
+                }
+    
+    # If not found, search all applications (for cross-app document lookup)
+    for app_id, docs in documents_store.items():
+        for doc in docs:
+            if doc["id"] == document_id:
+                return {
+                    "id": document_id,
+                    "status": doc["status"],
+                    "extracted_fields": doc.get("extracted_fields", []),
+                    "extracted_data": doc.get("extracted_data", {}),
+                    "extraction_info": doc.get("extraction_info", {}),
+                    "validation": doc.get("validation", {})
+                }
+    
+    raise HTTPException(status_code=404, detail="Document not found")
 
 
 @app.put("/api/documents/{application_id}/{document_id}/verify")
