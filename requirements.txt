@@ -7,10 +7,14 @@ plotly>=5.18.0
 streamlit-extras>=0.3.6
 fastapi>=0.109.0
 uvicorn>=0.27.0
-python-multipart>=0.0.6pdfplumber>=0.10.0
+python-multipart>=0.0.6
+pdfplumber>=0.10.0
 pytesseract>=0.3.10
+pdf2image>=1.16.0
 Pillow>=10.0.0
-# DocTR for advanced document extraction (optional - requires PyTorch)
-# python-doctr>=0.7.0
-# torch>=2.0.0
-# torchvision>=0.15.0
+PyPDF2>=3.0.0
+# OCR using Tesseract (requires tesseract-ocr system package)
+# For Windows: install from https://github.com/UB-Mannheim/tesseract/wiki
+# For Linux: sudo apt-get install tesseract-ocr
+# For macOS: brew install tesseract
+# PyPDF2 is used as fallback for PDF text extraction when poppler is unavailable

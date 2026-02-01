@@ -1,6 +1,7 @@
 """
-Integration module for DocTR extraction in the API
-Handles document uploads and extraction with fallback support
+Integration module for OCR-based extraction in the API
+Uses Tesseract OCR for document text extraction
+Handles document uploads and extraction with validation
 """
 
 from pathlib import Path
@@ -9,20 +10,15 @@ import json
 import os
 import tempfile
 
-# Try to use DocTR, fallback to pdfplumber if not available
-try:
-    from core.doctr_extractor import process_document as doctr_process
-    DOCTR_AVAILABLE = True
-except ImportError:
-    DOCTR_AVAILABLE = False
-    print("⚠️  DocTR module not available, will use fallback extraction")
-
+# Use OCR extractor instead of DocTR
+from core.ocr_extractor import process_document as ocr_process
 from core.document_extractor import process_uploaded_document as pdfplumber_process
 
 
 async def extract_document_with_doctr(file_path: str, application_id: str) -> Dict[str, Any]:
     """
-    Extract document using DocTR with fallback to pdfplumber
+    Extract document using Tesseract OCR (replaces DocTR)
+    Falls back to pdfplumber if OCR fails
     
     Args:
         file_path: Path to uploaded file
@@ -36,23 +32,18 @@ async def extract_document_with_doctr(file_path: str, application_id: str) -> Di
     print(f"   File: {Path(file_path).name}")
     
     try:
-        # Try DocTR first (for better accuracy on complex documents)
-        if DOCTR_AVAILABLE:
-            print("   Using DocTR OCR extraction...")
-            result = doctr_process(file_path)
-            
-            # Add metadata
-            result["application_id"] = application_id
-            result["extraction_method"] = "doctr"
-            result["file_path"] = file_path
-            
-            return result
-        else:
-            print("   DocTR not available, using fallback extraction...")
-            raise ImportError("DocTR not installed")
+        print("   Using Tesseract OCR extraction...")
+        result = ocr_process(file_path)
+        
+        # Add metadata
+        result["application_id"] = application_id
+        result["extraction_method"] = "tesseract_ocr"
+        result["file_path"] = file_path
+        
+        return result
             
     except Exception as e:
-        print(f"   ⚠️  DocTR extraction failed: {e}")
+        print(f"   ⚠️  OCR extraction failed: {e}")
         print("   🔄 Falling back to pdfplumber extraction...")
         
         try:
@@ -70,7 +61,7 @@ async def extract_document_with_doctr(file_path: str, application_id: str) -> Di
             return {
                 "application_id": application_id,
                 "status": "error",
-                "error": f"Extraction failed: {str(e)}. Fallback also failed: {str(fallback_error)}",
+                "error": f"OCR failed: {str(e)}. Fallback also failed: {str(fallback_error)}",
                 "extraction_method": "none",
                 "document_type": "ERROR",
                 "extracted_fields": {},

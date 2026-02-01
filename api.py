@@ -26,15 +26,14 @@ from core.document_extractor import process_uploaded_document, validate_extracte
 from core.improvement_suggester import generate_ai_suggestions
 from core.interview_questioner import generate_interview_questions
 
-# Import DocTR integration (with fallback support)
+# Import OCR integration (with fallback support)
 try:
     from core.doctr_integration import extract_document_with_doctr, validate_extracted_data_advanced, format_extraction_for_display
-    from core.doctr_extractor import initialize_ocr
-    DOCTR_AVAILABLE = True
-    print("✅ DocTR integration loaded")
+    OCR_AVAILABLE = True
+    print("[OK] OCR integration loaded (using Tesseract)")
 except ImportError as e:
-    DOCTR_AVAILABLE = False
-    print(f"⚠️  DocTR not available: {e}")
+    OCR_AVAILABLE = False
+    print(f"[WARNING] OCR not available: {e}")
     print("   Falling back to pdfplumber extraction")
 
 app = FastAPI(
@@ -51,12 +50,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Load DocTR model on startup (before any requests)
-if DOCTR_AVAILABLE:
-    print("\n🚀 Initializing DocTR OCR model at startup...")
-    initialize_ocr()
-    print("✅ DocTR ready for document processing\n")
 
 # Global instances
 explainer = None
@@ -104,9 +97,6 @@ class AnalysisResponse(BaseModel):
     pd_improvement_estimate: Dict[str, Any]
     timestamp: str
     model_version: str
-
-
-
 
 
 def load_model():
@@ -161,18 +151,19 @@ async def analyze_application(application: CustomerApplication):
         customer_data = application.dict()
         
         print("\n" + "="*60)
-        print("ANALYZING APPLICATION")
+        print("🔍 ANALYZING APPLICATION")
         print("="*60)
-        print(f"\n🆔 Application ID: {app_id}")
-        print("\n📋 RECEIVED DATA:")
+        print(f"\nApplication ID: {app_id}")
+        print("\n[INFO] RECEIVED DATA FROM FRONTEND:")
         print(f"  monthly_income: {customer_data.get('monthly_income')}")
         print(f"  savings_balance: {customer_data.get('savings_balance')}")
         print(f"  fixed_monthly_expenses: {customer_data.get('fixed_monthly_expenses')}")
         print(f"  employment_years: {customer_data.get('employment_years')}")
         print(f"  credit_score: {customer_data.get('credit_score')}")
+        print(f"  [Note: Check if these look like extracted data or defaults]")
         
         # Try to find and use extracted document data if available
-        print("\n📄 CHECKING FOR EXTRACTED DOCUMENT DATA...")
+        print("\n[INFO] CHECKING FOR EXTRACTED DOCUMENT DATA...")
         extracted_data_used = False
         
         # Copy documents from temporary IDs to the new application ID
@@ -181,30 +172,34 @@ async def analyze_application(application: CustomerApplication):
         
         # Look for documents in any temp or other app IDs (any non-CR app IDs)
         temp_app_ids = [key for key in documents_store.keys() if not key.startswith('CR-')]
-        print(f"\n  Found {len(temp_app_ids)} temporary applications")
+        print(f"\n  Found {len(temp_app_ids)} temporary applications: {temp_app_ids}")
         
         if temp_app_ids:
             for temp_app_id in temp_app_ids:
                 if documents_store[temp_app_id]:
                     doc_count = len(documents_store[temp_app_id])
-                    print(f"  ✓ Moving {doc_count} documents from {temp_app_id}")
+                    doc_ids = [doc['id'] for doc in documents_store[temp_app_id]]
+                    print(f"  [✓] Moving {doc_count} documents from {temp_app_id}")
+                    print(f"      Document IDs: {doc_ids}")
                     # Copy all documents to the new app ID
                     documents_store[app_id].extend(documents_store[temp_app_id])
                     # Clear the temp ID
                     documents_store[temp_app_id] = []
         else:
-            print(f"  ℹ️  No temporary documents found")
+            print(f"  [INFO] No temporary documents found")
         
         # Look for documents in the NEW application ID first (where we just moved them)
         docs_to_check = documents_store.get(app_id, [])
+        print(f"\n  Total documents for this application: {len(docs_to_check)}")
         
         # Find documents with extracted data
         for doc in docs_to_check:
-            if doc.get("status") in ["extracted", "extracted_with_issues"] and doc.get("extracted_data"):
+            if doc.get("status") in ["extracted", "extracted_with_issues"]:
                 extracted_fields = doc.get("extracted_data", {})
                 doc_type = doc.get("extraction_info", {}).get("document_type", "UNKNOWN")
                 
                 if not extracted_fields:
+                    print(f"  [INFO] Document has status '{doc.get('status')}' but no extracted fields")
                     continue
                 
                 print(f"\n  Found extracted {doc_type} with fields: {list(extracted_fields.keys())}")
@@ -235,35 +230,35 @@ async def analyze_application(application: CustomerApplication):
                     
                     # Skip fields that explicitly map to None
                     if mapped_field is None:
-                        print(f"    ℹ️  Extracted {extracted_field}: {extracted_value} (not used for modeling)")
+                        print(f"    [INFO] Extracted {extracted_field}: {extracted_value} (not used for modeling)")
                         continue
                     
                     if mapped_field:
-                        # Only override if field was using default value
-                        current_value = customer_data.get(mapped_field)
-                        
-                        # Check if it's a default value (try to use extracted if available)
-                        if current_value is not None:
-                            try:
-                                # Convert extracted value to number if needed
-                                if isinstance(extracted_value, str):
-                                    extracted_num = float(extracted_value.replace(',', '.'))
-                                else:
-                                    extracted_num = float(extracted_value)
-                                
-                                # Use extracted value
-                                customer_data[mapped_field] = extracted_num
-                                print(f"    ✓ Using extracted {extracted_field}: {extracted_num} → {mapped_field}")
-                                extracted_data_used = True
-                            except (ValueError, TypeError):
-                                print(f"    ✗ Could not parse extracted {extracted_field}: {extracted_value}")
+                        # Try to use extracted value regardless of current value
+                        try:
+                            # Convert extracted value to number if needed
+                            if isinstance(extracted_value, str):
+                                extracted_num = float(extracted_value.replace(',', '.'))
+                            else:
+                                extracted_num = float(extracted_value)
+                            
+                            # Use extracted value
+                            old_value = customer_data.get(mapped_field)
+                            customer_data[mapped_field] = extracted_num
+                            print(f"    [✓] Using extracted {extracted_field}: {extracted_num} -> {mapped_field} (was: {old_value})")
+                            extracted_data_used = True
+                        except (ValueError, TypeError):
+                            print(f"    [✗] Could not parse extracted {extracted_field}: {extracted_value}")
         
         if not extracted_data_used:
-            print("    ⚠️  No relevant extracted data found. Using provided values.")
+            print("\n    [!] No extracted data was used. Using provided values only.")
+        else:
+            print("\n    [✓] Extracted data successfully integrated into analysis.")
         
-        print("\n📊 FINAL DATA FOR ANALYSIS:")
+        print("\n[INFO] FINAL DATA FOR ANALYSIS:")
         print(f"  monthly_income: {customer_data.get('monthly_income')}")
         print(f"  savings_balance: {customer_data.get('savings_balance')}")
+        print(f"  credit_score: {customer_data.get('credit_score')}")
         print(f"  fixed_monthly_expenses: {customer_data.get('fixed_monthly_expenses')}")
         print(f"  loan_amount: {customer_data.get('loan_amount')}")
         print("="*60 + "\n")
@@ -297,7 +292,7 @@ async def analyze_application(application: CustomerApplication):
             pd_score=analysis["pd_score"]
         )
         
-        print(f"\n📋 Generated {len(interview_questions)} personalized interview questions")
+        print(f"\n[INFO] Generated {len(interview_questions)} personalized interview questions")
 
         # Generate AI suggestions based on actual feature impact
         ai_suggestions = generate_ai_suggestions(
@@ -307,7 +302,7 @@ async def analyze_application(application: CustomerApplication):
             lime_features=analysis["lime_features"]
         )
         
-        print(f"\n✨ Generated {len(ai_suggestions)} AI improvement suggestions")
+        print(f"\n[OK] Generated {len(ai_suggestions)} AI improvement suggestions")
         for sugg in ai_suggestions:
             print(f"  - {sugg['user_friendly']}: {sugg['pd_reduction']} reduction")
 
@@ -394,15 +389,15 @@ async def analyze_application(application: CustomerApplication):
 
 def _extract_document_background(file_path: str, application_id: str, file_id: str, filename: str):
     """
-    Background task to extract document data without blocking the HTTP response
+    Background task to extract document data using OCR without blocking the HTTP response
     """
     try:
-        print(f"📋 Background extraction started for {filename}")
+        print(f"[INFO] Background extraction started for {filename}")
         
-        # Extract data from document using DocTR (with fallback)
-        if DOCTR_AVAILABLE:
-            print(f"   Using DocTR extraction for {file_id}...")
-            from core.doctr_extractor import process_document
+        # Extract data from document using OCR (with fallback)
+        if OCR_AVAILABLE:
+            print(f"   Using Tesseract OCR extraction for {file_id}...")
+            from core.ocr_extractor import process_document
             extraction_result = process_document(file_path)
             
             # Validate extraction
@@ -419,7 +414,7 @@ def _extract_document_background(file_path: str, application_id: str, file_id: s
             warnings = validation_result.get("warnings", [])
             
             extraction_info = {
-                "method": extraction_result.get("extraction_method", "doctr"),
+                "method": extraction_result.get("extraction_method", "tesseract_ocr"),
                 "document_type": extraction_result.get("document_type", "UNKNOWN"),
                 "confidence_score": extraction_result.get("confidence_score", 0),
                 "ocr_confidence": extraction_result.get("ocr_confidence", 0),
@@ -442,7 +437,7 @@ def _extract_document_background(file_path: str, application_id: str, file_id: s
             }
             
     except Exception as extract_err:
-        print(f"   ❌ Error extracting data: {str(extract_err)}")
+        print(f"   [ERROR] Error extracting data: {str(extract_err)}")
         import traceback
         traceback.print_exc()
         
@@ -473,14 +468,14 @@ def _extract_document_background(file_path: str, application_id: str, file_id: s
                 }
                 doc["extraction_info"] = extraction_info
                 
-                print(f"   ✅ Extraction complete for {file_id}")
+                print(f"   [OK] Extraction complete for {file_id}")
                 print(f"      Document type: {extraction_info.get('document_type')}")
                 print(f"      Status: {extraction_status}")
                 print(f"      Fields extracted: {len(extracted_fields)}")
                 print(f"      Document stored in app: {application_id}")
                 break
     else:
-        print(f"   ⚠️  WARNING: App {application_id} not in documents_store!")
+        print(f"   [WARNING] App {application_id} not in documents_store!")
         print(f"      Available apps: {list(documents_store.keys())}")
         print(f"      Creating app entry and storing document...")
         # Ensure app exists
@@ -527,7 +522,7 @@ async def upload_document(application_id: str, file: UploadFile = File(...), bac
         with open(file_path, 'wb') as f:
             f.write(content)
 
-        print(f"\n📄 Document uploaded: {file.filename}")
+        print(f"\n[INFO] Document uploaded: {file.filename}")
         print(f"   File ID: {file_id}")
         print(f"   Size: {len(content)} bytes")
         print(f"   Status: Queued for extraction")
@@ -570,7 +565,7 @@ async def upload_document(application_id: str, file: UploadFile = File(...), bac
     except HTTPException:
         raise
     except Exception as e:
-        print(f"   ❌ Unexpected error: {str(e)}")
+        print(f"   [ERROR] Unexpected error: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -579,7 +574,7 @@ async def upload_document(application_id: str, file: UploadFile = File(...), bac
 @app.get("/api/debug/documents")
 async def debug_get_all_documents():
     """
-    DEBUG ENDPOINT: Show all documents in store
+    DEBUG ENDPOINT: Show all documents in store with full details
     """
     result = {}
     for app_id, docs in documents_store.items():
@@ -588,7 +583,9 @@ async def debug_get_all_documents():
                 "id": doc["id"],
                 "filename": doc["filename"],
                 "status": doc["status"],
-                "extracted_fields": len(doc.get("extracted_fields", []))
+                "extracted_fields": doc.get("extracted_fields", []),
+                "extracted_data": doc.get("extracted_data", {}),
+                "extraction_info": doc.get("extraction_info", {})
             }
             for doc in docs
         ]
